@@ -8,8 +8,9 @@ from .cache import StaticKVCache
 
 def rms_layernorm(hidden: torch.Tensor, weight: torch.Tensor, eps: float):
     old_dtype = hidden.dtype
-    variance = hidden.to(torch.float32).pow(2).mean(dim=-1, keepdim=True)
-    hidden = (hidden * torch.rsqrt(variance + eps)).to(old_dtype)
+    # Compute variance in float32 without keeping the full float32 copy alive
+    variance = hidden.float().pow(2).mean(dim=-1, keepdim=True)
+    hidden = (hidden * torch.rsqrt(variance.to(old_dtype) + eps))
     return hidden * weight
 
 
@@ -196,8 +197,6 @@ class MiniCPMAttention(nn.Module):
         key_cache[:, :, position_id, :] = key_states
         value_cache[:, :, position_id, :] = value_states
 
-        # Use an explicit broadcastable mask shape for SDPA. A 1D mask can
-        # trigger a CPU-side dimension bug in some PyTorch versions.
         attn_mask = (torch.arange(key_cache.size(2), device=key_cache.device) <= position_id).view(1, 1, 1, -1)
 
         # ref: https://github.com/pytorch/pytorch/issues/163597

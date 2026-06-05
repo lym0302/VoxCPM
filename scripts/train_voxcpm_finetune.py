@@ -182,7 +182,13 @@ def train(
     )
     # Save audio_vae and output sample rate for audio generation.
     # Prefer model's actual output rate; fall back to YAML out_sample_rate or encode rate.
-    audio_vae_for_gen = base_model.audio_vae
+    # Build a separate CPU copy via state_dict so that moving it to GPU during generation
+    # does not affect batch_processor.audio_vae (which must stay on CUDA for training).
+    # deepcopy is not used because weight_norm creates non-leaf tensors that deepcopy rejects.
+    from voxcpm.modules.audiovae import AudioVAEV2
+    _vae_cfg = getattr(base_model.config, "audio_vae_config", None)
+    audio_vae_for_gen = AudioVAEV2(config=_vae_cfg).to(torch.float32)
+    audio_vae_for_gen.load_state_dict(base_model.audio_vae.state_dict())
     out_sr = base_model.sample_rate  # decoder output rate (e.g. 48000 for V2)
     if out_sr == 0 and out_sample_rate > 0:
         out_sr = out_sample_rate
@@ -280,6 +286,7 @@ def train(
 
             # Gradient accumulation: accumulate gradients over micro-batches before optimizer step
             loss_dict = {}
+            oom_skipped = False
             for micro_step in range(grad_accum_steps):
                 batch = get_next_batch()
                 processed = batch_processor(batch)
@@ -289,30 +296,41 @@ def train(
                 is_last_micro_step = micro_step == grad_accum_steps - 1
                 sync_context = contextlib.nullcontext() if is_last_micro_step else accelerator.no_sync()
 
-                with sync_context:
-                    with accelerator.autocast(dtype=torch.bfloat16):
-                        outputs = model(
-                            processed["text_tokens"],
-                            processed["text_mask"],
-                            processed["audio_feats"],
-                            processed["audio_mask"],
-                            processed["loss_mask"],
-                            processed["position_ids"],
-                            processed["labels"],
-                            progress=step / max(1, num_iters),
-                        )
+                try:
+                    with sync_context:
+                        with accelerator.autocast(dtype=torch.bfloat16):
+                            outputs = model(
+                                processed["text_tokens"],
+                                processed["text_mask"],
+                                processed["audio_feats"],
+                                processed["audio_mask"],
+                                processed["loss_mask"],
+                                processed["position_ids"],
+                                processed["labels"],
+                                progress=step / max(1, num_iters),
+                            )
 
-                    total_loss = 0.0
-                    for key, value in outputs.items():
-                        if key.startswith("loss/"):
-                            weight = lambdas.get(key, 1.0)
-                            loss_value = value * weight / grad_accum_steps
-                            total_loss = total_loss + loss_value
-                            # Record raw loss from last micro-batch for logging
-                            loss_dict[key] = value.detach()
+                        total_loss = 0.0
+                        for key, value in outputs.items():
+                            if key.startswith("loss/"):
+                                weight = lambdas.get(key, 1.0)
+                                loss_value = value * weight / grad_accum_steps
+                                total_loss = total_loss + loss_value
+                                # Record raw loss from last micro-batch for logging
+                                loss_dict[key] = value.detach()
 
-                    # Accumulate gradients (normalized by grad_accum_steps)
-                    accelerator.backward(total_loss)
+                        # Accumulate gradients (normalized by grad_accum_steps)
+                        accelerator.backward(total_loss)
+                except torch.cuda.OutOfMemoryError:
+                    tracker.print(f"[Warning] OOM at step {step} micro_step {micro_step}, skipping batch "
+                                  f"(seq_len={processed['audio_feats'].shape[1]})")
+                    optimizer.zero_grad(set_to_none=True)
+                    torch.cuda.empty_cache()
+                    oom_skipped = True
+                    break
+
+            if oom_skipped:
+                continue
 
             # After all micro-batches, do unscale / grad_norm / step
             scaler = getattr(accelerator, "scaler", None)
@@ -467,6 +485,7 @@ def validate(
             tracker.print(f"[Warning] Skip audio generation: missing {', '.join(missing)}")
 
     model.train()
+    torch.cuda.empty_cache()
 
 
 def compute_mel_spectrogram(audio_np, sample_rate, n_mels=128):
@@ -589,7 +608,8 @@ def generate_sample_audio(
             # Inference setup
             unwrapped_model.eval()
             # unwrapped_model.to(torch.bfloat16)
-            unwrapped_model.audio_vae = audio_vae.to(torch.float32)
+            audio_vae.to(accelerator.device)
+            unwrapped_model.audio_vae = audio_vae
 
             log(f"[Audio] Generating sample {i} with text: '{text[:50]}...'")
             autocast_ctx = (
@@ -600,6 +620,7 @@ def generate_sample_audio(
             with torch.no_grad():
                 with autocast_ctx:
                     generated = unwrapped_model.generate(target_text=text, inference_timesteps=10, cfg_value=2.0)
+            torch.cuda.empty_cache()
 
             # Restore training setup
             # unwrapped_model.to(torch.float32)
@@ -633,6 +654,8 @@ def generate_sample_audio(
                 mel_ref = compute_mel_spectrogram(ref_audio_np, sample_rate) if ref_audio_np is not None else None
                 fig = create_mel_figure(gen_audio_np, mel_gen, gen_sr, step, ref_audio_np, mel_ref)
                 writer.add_figure(f"{tag}/mel_spectrogram", fig, global_step=step)
+                import matplotlib.pyplot as plt
+                plt.close(fig)
                 log(f"[Audio] Created mel spectrogram figure for sample {i}")
             except Exception as e:
                 log(f"[Warning] Failed to create mel spectrogram: {e}")
@@ -648,6 +671,8 @@ def generate_sample_audio(
             try:
                 # unwrapped_model.to(torch.float32)
                 unwrapped_model.audio_vae = None
+                audio_vae.to("cpu")
+                torch.cuda.empty_cache()
                 if prev_training:
                     unwrapped_model.train()
                 else:
@@ -809,7 +834,7 @@ def save_checkpoint(
                 if src.exists():
                     shutil.copy2(src, folder / fname)
 
-    torch.save(optimizer.state_dict(), folder / "optimizer.pth")
+    # torch.save(optimizer.state_dict(), folder / "optimizer.pth")  不保存这个节省空间
     torch.save(scheduler.state_dict(), folder / "scheduler.pth")
     with open(folder / "training_state.json", "w", encoding="utf-8") as f:
         json.dump({"step": int(step)}, f)

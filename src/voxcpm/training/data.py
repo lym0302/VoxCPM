@@ -1,9 +1,10 @@
+import json as _json
 import math
 from typing import Dict, List, Optional, Tuple
 
 import argbind
 import torch
-from datasets import Audio, Dataset, DatasetDict, load_dataset
+from datasets import Audio, Dataset, DatasetDict, Features, Value, load_dataset
 from torch.utils.data import Dataset as TorchDataset
 
 from ..model.voxcpm import VoxCPMConfig
@@ -14,6 +15,59 @@ DEFAULT_TEXT_COLUMN = "text"
 DEFAULT_AUDIO_COLUMN = "audio"
 DEFAULT_REF_AUDIO_COLUMN = "ref_audio"
 DEFAULT_ID_COLUMN = "dataset_id"
+
+_PY_TO_HF = {str: Value("string"), int: Value("int64"), float: Value("float64"), bool: Value("bool")}
+
+
+def _peek_common_schema(paths: List[str]) -> Tuple[List[str], Features]:
+    """Peek at the first valid line of each path; return (common_cols, Features).
+
+    Takes the intersection of column names so extra columns in any file/row
+    are safely ignored during loading.
+    """
+    first_rows: List[dict] = []
+    for path in paths:
+        try:
+            with open(path) as fh:
+                for raw in fh:
+                    raw = raw.strip()
+                    if raw:
+                        first_rows.append(_json.loads(raw))
+                        break
+        except (OSError, _json.JSONDecodeError):
+            pass
+    if not first_rows:
+        raise ValueError(f"No readable data found in: {paths}")
+    common_keys: Optional[set] = None
+    for row in first_rows:
+        common_keys = set(row) if common_keys is None else common_keys & set(row)
+    common_keys_sorted = sorted(common_keys or [])
+    ref = first_rows[0]
+    features = Features({k: _PY_TO_HF.get(type(ref.get(k)), Value("string")) for k in common_keys_sorted})
+    return common_keys_sorted, features
+
+
+def _iter_jsonl(paths: List[str], required_cols: List[str], allowed_cols: List[str]):
+    """Yield rows from JSONL files, skipping rows that lack any required column."""
+    skipped = 0
+    for path in paths:
+        with open(path) as fh:
+            for raw in fh:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    row = _json.loads(raw)
+                except _json.JSONDecodeError:
+                    skipped += 1
+                    continue
+                if any(not row.get(col) for col in required_cols):
+                    skipped += 1
+                    continue
+                yield {k: row.get(k) for k in allowed_cols}
+    if skipped:
+        import logging
+        logging.getLogger(__name__).warning("Skipped %d rows with missing required fields in %s", skipped, paths)
 
 
 @argbind.bind()
@@ -27,11 +81,22 @@ def load_audio_text_datasets(
     sample_rate: int = 16_000,
     num_proc: int = 1,
 ) -> Tuple[Dataset, Optional[Dataset]]:
-    data_files = {"train": train_manifest}
-    if val_manifest:
-        data_files["validation"] = val_manifest
+    required_cols = [audio_column, text_column]
+    all_paths = [train_manifest] + ([val_manifest] if val_manifest else [])
+    allowed_cols, features = _peek_common_schema(all_paths)
 
-    dataset_dict: DatasetDict = load_dataset("json", data_files=data_files)
+    train_ds_raw = Dataset.from_generator(
+        _iter_jsonl,
+        gen_kwargs={"paths": [train_manifest], "required_cols": required_cols, "allowed_cols": allowed_cols},
+        features=features,
+    )
+    dataset_dict: DatasetDict = DatasetDict({"train": train_ds_raw})
+    if val_manifest:
+        dataset_dict["validation"] = Dataset.from_generator(
+            _iter_jsonl,
+            gen_kwargs={"paths": [val_manifest], "required_cols": required_cols, "allowed_cols": allowed_cols},
+            features=features,
+        )
 
     def prepare(ds: Dataset) -> Dataset:
         if audio_column not in ds.column_names:

@@ -1,7 +1,36 @@
 launch.json
-.venv/
 __pycache__
 voxcpm.egg-info
 .DS_Store
 ./pretrained_models/
 app_local.py
+
+
+
+
+# lym
+# exps 开头的目录
+exps*/
+**/exps*/
+exps
+
+# bakbak 目录
+bakbak/
+**/bakbak/
+
+# output 开头的目录
+output*/
+**/output*/
+
+# logs 目录
+logs/
+**/logs/
+
+# 所有 log 文件
+*.log
+
+# 所有 wav 文件
+**/eval_audios*/
+pretrained_models
+*test*.py
+datas
